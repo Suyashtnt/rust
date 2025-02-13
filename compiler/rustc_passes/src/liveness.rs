@@ -81,12 +81,10 @@
 //! We generate various special nodes for various, well, special purposes.
 //! These are described in the `Liveness` struct.
 
-use crate::errors;
+use std::io;
+use std::io::prelude::*;
+use std::rc::Rc;
 
-use self::LiveNodeKind::*;
-use self::VarKind::*;
-
-use rustc_ast::InlineAsmOptions;
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_hir as hir;
 use rustc_hir::def::*;
@@ -95,14 +93,15 @@ use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{Expr, HirId, HirIdMap, HirIdSet};
 use rustc_index::IndexVec;
 use rustc_middle::query::Providers;
+use rustc_middle::span_bug;
 use rustc_middle::ty::{self, RootVariableMinCaptureList, Ty, TyCtxt};
 use rustc_session::lint;
-use rustc_span::symbol::{kw, sym, Symbol};
-use rustc_span::{BytePos, Span};
+use rustc_span::{BytePos, Span, Symbol, kw, sym};
+use tracing::{debug, instrument};
 
-use std::io;
-use std::io::prelude::*;
-use std::rc::Rc;
+use self::LiveNodeKind::*;
+use self::VarKind::*;
+use crate::errors;
 
 mod rwu_table;
 
@@ -153,9 +152,8 @@ fn check_liveness(tcx: TyCtxt<'_>, def_id: LocalDefId) {
     }
 
     let mut maps = IrMaps::new(tcx);
-    let body_id = tcx.hir().body_owned_by(def_id);
-    let hir_id = tcx.hir().body_owner(body_id);
-    let body = tcx.hir().body(body_id);
+    let body = tcx.hir().body_owned_by(def_id);
+    let hir_id = tcx.hir().body_owner(body.id());
 
     if let Some(upvars) = tcx.upvars_mentioned(def_id) {
         for &var_hir_id in upvars.keys() {
@@ -166,20 +164,20 @@ fn check_liveness(tcx: TyCtxt<'_>, def_id: LocalDefId) {
 
     // gather up the various local variables, significant expressions,
     // and so forth:
-    maps.visit_body(body);
+    maps.visit_body(&body);
 
     // compute liveness
     let mut lsets = Liveness::new(&mut maps, def_id);
-    let entry_ln = lsets.compute(body, hir_id);
-    lsets.log_liveness(entry_ln, body_id.hir_id);
+    let entry_ln = lsets.compute(&body, hir_id);
+    lsets.log_liveness(entry_ln, body.id().hir_id);
 
     // check for various error conditions
-    lsets.visit_body(body);
+    lsets.visit_body(&body);
     lsets.warn_about_unused_upvars(entry_ln);
-    lsets.warn_about_unused_args(body, entry_ln);
+    lsets.warn_about_unused_args(&body, entry_ln);
 }
 
-pub fn provide(providers: &mut Providers) {
+pub(crate) fn provide(providers: &mut Providers) {
     *providers = Providers { check_liveness, ..*providers };
 }
 
@@ -343,7 +341,7 @@ impl<'tcx> IrMaps<'tcx> {
 }
 
 impl<'tcx> Visitor<'tcx> for IrMaps<'tcx> {
-    fn visit_local(&mut self, local: &'tcx hir::Local<'tcx>) {
+    fn visit_local(&mut self, local: &'tcx hir::LetStmt<'tcx>) {
         self.add_from_pat(local.pat);
         if local.els.is_some() {
             self.add_live_node_for_node(local.hir_id, ExprNode(local.span, local.hir_id));
@@ -416,6 +414,12 @@ impl<'tcx> Visitor<'tcx> for IrMaps<'tcx> {
                 self.add_live_node_for_node(expr.hir_id, ExprNode(expr.span, expr.hir_id));
             }
 
+            // Inline assembly may contain labels.
+            hir::ExprKind::InlineAsm(asm) if asm.contains_label() => {
+                self.add_live_node_for_node(expr.hir_id, ExprNode(expr.span, expr.hir_id));
+                intravisit::walk_expr(self, expr);
+            }
+
             // otherwise, live nodes are not required:
             hir::ExprKind::Index(..)
             | hir::ExprKind::Field(..)
@@ -442,6 +446,7 @@ impl<'tcx> Visitor<'tcx> for IrMaps<'tcx> {
             | hir::ExprKind::InlineAsm(..)
             | hir::ExprKind::OffsetOf(..)
             | hir::ExprKind::Type(..)
+            | hir::ExprKind::UnsafeBinderCast(..)
             | hir::ExprKind::Err(_)
             | hir::ExprKind::Path(hir::QPath::TypeRelative(..))
             | hir::ExprKind::Path(hir::QPath::LangItem(..)) => {}
@@ -463,7 +468,7 @@ const ACC_USE: u32 = 4;
 struct Liveness<'a, 'tcx> {
     ir: &'a mut IrMaps<'tcx>,
     typeck_results: &'a ty::TypeckResults<'tcx>,
-    param_env: ty::ParamEnv<'tcx>,
+    typing_env: ty::TypingEnv<'tcx>,
     closure_min_captures: Option<&'tcx RootVariableMinCaptureList<'tcx>>,
     successors: IndexVec<LiveNode, Option<LiveNode>>,
     rwu_table: rwu_table::RWUTable,
@@ -486,7 +491,8 @@ struct Liveness<'a, 'tcx> {
 impl<'a, 'tcx> Liveness<'a, 'tcx> {
     fn new(ir: &'a mut IrMaps<'tcx>, body_owner: LocalDefId) -> Liveness<'a, 'tcx> {
         let typeck_results = ir.tcx.typeck(body_owner);
-        let param_env = ir.tcx.param_env(body_owner);
+        // FIXME(#132279): we're in a body here.
+        let typing_env = ty::TypingEnv::non_body_analysis(ir.tcx, body_owner);
         let closure_min_captures = typeck_results.closure_min_captures.get(&body_owner);
         let closure_ln = ir.add_live_node(ClosureNode);
         let exit_ln = ir.add_live_node(ExitNode);
@@ -497,7 +503,7 @@ impl<'a, 'tcx> Liveness<'a, 'tcx> {
         Liveness {
             ir,
             typeck_results,
-            param_env,
+            typing_env,
             closure_min_captures,
             successors: IndexVec::from_elem_n(None, num_live_nodes),
             rwu_table: rwu_table::RWUTable::new(num_live_nodes, num_vars),
@@ -597,7 +603,7 @@ impl<'a, 'tcx> Liveness<'a, 'tcx> {
         String::from_utf8(wr).unwrap()
     }
 
-    fn log_liveness(&self, entry_ln: LiveNode, hir_id: hir::HirId) {
+    fn log_liveness(&self, entry_ln: LiveNode, hir_id: HirId) {
         // hack to skip the loop unless debug! is enabled:
         debug!(
             "^^ liveness computation results for body {} (entry={:?})",
@@ -766,7 +772,7 @@ impl<'a, 'tcx> Liveness<'a, 'tcx> {
 
     fn propagate_through_stmt(&mut self, stmt: &hir::Stmt<'_>, succ: LiveNode) -> LiveNode {
         match stmt.kind {
-            hir::StmtKind::Local(local) => {
+            hir::StmtKind::Let(local) => {
                 // Note: we mark the variable as defined regardless of whether
                 // there is an initializer. Initially I had thought to only mark
                 // the live variable as defined if it was initialized, and then we
@@ -1001,7 +1007,12 @@ impl<'a, 'tcx> Liveness<'a, 'tcx> {
             hir::ExprKind::Array(exprs) => self.propagate_through_exprs(exprs, succ),
 
             hir::ExprKind::Struct(_, fields, ref with_expr) => {
-                let succ = self.propagate_through_opt_expr(with_expr.as_deref(), succ);
+                let succ = match with_expr {
+                    hir::StructTailExpr::Base(base) => {
+                        self.propagate_through_opt_expr(Some(base), succ)
+                    }
+                    hir::StructTailExpr::None | hir::StructTailExpr::DefaultFields(_) => succ,
+                };
                 fields
                     .iter()
                     .rev()
@@ -1040,25 +1051,59 @@ impl<'a, 'tcx> Liveness<'a, 'tcx> {
             hir::ExprKind::AddrOf(_, _, ref e)
             | hir::ExprKind::Cast(ref e, _)
             | hir::ExprKind::Type(ref e, _)
+            | hir::ExprKind::UnsafeBinderCast(_, ref e, _)
             | hir::ExprKind::DropTemps(ref e)
             | hir::ExprKind::Unary(_, ref e)
             | hir::ExprKind::Repeat(ref e, _) => self.propagate_through_expr(e, succ),
 
             hir::ExprKind::InlineAsm(asm) => {
-                // Handle non-returning asm
-                let mut succ = if asm.options.contains(InlineAsmOptions::NORETURN) {
-                    self.exit_ln
-                } else {
-                    succ
-                };
+                //
+                //     (inputs)
+                //        |
+                //        v
+                //     (outputs)
+                //    /         \
+                //    |         |
+                //    v         v
+                // (labels)(fallthrough)
+                //    |         |
+                //    v         v
+                // ( succ / exit_ln )
 
-                // Do a first pass for writing outputs only
+                // Handle non-returning asm
+                let mut succ =
+                    if self.typeck_results.expr_ty(expr).is_never() { self.exit_ln } else { succ };
+
+                // Do a first pass for labels only
+                if asm.contains_label() {
+                    let ln = self.live_node(expr.hir_id, expr.span);
+                    self.init_from_succ(ln, succ);
+                    for (op, _op_sp) in asm.operands.iter().rev() {
+                        match op {
+                            hir::InlineAsmOperand::Label { block } => {
+                                let label_ln = self.propagate_through_block(block, succ);
+                                self.merge_from_succ(ln, label_ln);
+                            }
+                            hir::InlineAsmOperand::In { .. }
+                            | hir::InlineAsmOperand::Out { .. }
+                            | hir::InlineAsmOperand::InOut { .. }
+                            | hir::InlineAsmOperand::SplitInOut { .. }
+                            | hir::InlineAsmOperand::Const { .. }
+                            | hir::InlineAsmOperand::SymFn { .. }
+                            | hir::InlineAsmOperand::SymStatic { .. } => {}
+                        }
+                    }
+                    succ = ln;
+                }
+
+                // Do a second pass for writing outputs only
                 for (op, _op_sp) in asm.operands.iter().rev() {
                     match op {
                         hir::InlineAsmOperand::In { .. }
                         | hir::InlineAsmOperand::Const { .. }
                         | hir::InlineAsmOperand::SymFn { .. }
-                        | hir::InlineAsmOperand::SymStatic { .. } => {}
+                        | hir::InlineAsmOperand::SymStatic { .. }
+                        | hir::InlineAsmOperand::Label { .. } => {}
                         hir::InlineAsmOperand::Out { expr, .. } => {
                             if let Some(expr) = expr {
                                 succ = self.write_place(expr, succ, ACC_WRITE);
@@ -1075,7 +1120,7 @@ impl<'a, 'tcx> Liveness<'a, 'tcx> {
                     }
                 }
 
-                // Then do a second pass for inputs
+                // Then do a third pass for inputs
                 for (op, _op_sp) in asm.operands.iter().rev() {
                     match op {
                         hir::InlineAsmOperand::In { expr, .. } => {
@@ -1097,7 +1142,8 @@ impl<'a, 'tcx> Liveness<'a, 'tcx> {
                         }
                         hir::InlineAsmOperand::Const { .. }
                         | hir::InlineAsmOperand::SymFn { .. }
-                        | hir::InlineAsmOperand::SymStatic { .. } => {}
+                        | hir::InlineAsmOperand::SymStatic { .. }
+                        | hir::InlineAsmOperand::Label { .. } => {}
                     }
                 }
                 succ
@@ -1258,7 +1304,7 @@ impl<'a, 'tcx> Liveness<'a, 'tcx> {
     fn check_is_ty_uninhabited(&mut self, expr: &Expr<'_>, succ: LiveNode) -> LiveNode {
         let ty = self.typeck_results.expr_ty(expr);
         let m = self.ir.tcx.parent_module(expr.hir_id).to_def_id();
-        if ty.is_inhabited_from(self.ir.tcx, m, self.param_env) {
+        if ty.is_inhabited_from(self.ir.tcx, m, self.typing_env) {
             return succ;
         }
         match self.ir.lnks[succ] {
@@ -1311,10 +1357,10 @@ impl<'a, 'tcx> Liveness<'a, 'tcx> {
 // Checking for error conditions
 
 impl<'a, 'tcx> Visitor<'tcx> for Liveness<'a, 'tcx> {
-    fn visit_local(&mut self, local: &'tcx hir::Local<'tcx>) {
+    fn visit_local(&mut self, local: &'tcx hir::LetStmt<'tcx>) {
         self.check_unused_vars_in_pat(local.pat, None, None, |spans, hir_id, ln, var| {
             if local.init.is_some() {
-                self.warn_about_dead_assign(spans, hir_id, ln, var);
+                self.warn_about_dead_assign(spans, hir_id, ln, var, None);
             }
         });
 
@@ -1398,6 +1444,7 @@ fn check_expr<'tcx>(this: &mut Liveness<'_, 'tcx>, expr: &'tcx Expr<'tcx>) {
         | hir::ExprKind::Path(_)
         | hir::ExprKind::Yield(..)
         | hir::ExprKind::Type(..)
+        | hir::ExprKind::UnsafeBinderCast(..)
         | hir::ExprKind::Err(_) => {}
     }
 }
@@ -1413,7 +1460,8 @@ impl<'tcx> Liveness<'_, 'tcx> {
                     // as being used.
                     let ln = self.live_node(expr.hir_id, expr.span);
                     let var = self.variable(var_hid, expr.span);
-                    self.warn_about_dead_assign(vec![expr.span], expr.hir_id, ln, var);
+                    let sugg = self.annotate_mut_binding_to_immutable_binding(var_hid, expr);
+                    self.warn_about_dead_assign(vec![expr.span], expr.hir_id, ln, var, sugg);
                 }
             }
             _ => {
@@ -1461,21 +1509,27 @@ impl<'tcx> Liveness<'_, 'tcx> {
                             );
                         }
                     }
-                } else {
-                    if let Some(name) = self.should_warn(var) {
-                        self.ir.tcx.emit_node_span_lint(
-                            lint::builtin::UNUSED_VARIABLES,
-                            var_hir_id,
-                            vec![span],
-                            errors::UnusedVarMaybeCaptureRef { name },
-                        );
-                    }
+                } else if let Some(name) = self.should_warn(var) {
+                    self.ir.tcx.emit_node_span_lint(
+                        lint::builtin::UNUSED_VARIABLES,
+                        var_hir_id,
+                        vec![span],
+                        errors::UnusedVarMaybeCaptureRef { name },
+                    );
                 }
             }
         }
     }
 
     fn warn_about_unused_args(&self, body: &hir::Body<'_>, entry_ln: LiveNode) {
+        if let Some(intrinsic) =
+            self.ir.tcx.intrinsic(self.ir.tcx.hir().body_owner_def_id(body.id()))
+        {
+            if intrinsic.must_be_overridden {
+                return;
+            }
+        }
+
         for p in body.params {
             self.check_unused_vars_in_pat(
                 p.pat,
@@ -1537,6 +1591,74 @@ impl<'tcx> Liveness<'_, 'tcx> {
             } else {
                 self.report_unused(hir_ids_and_spans, ln, var, can_remove, pat, opt_body);
             }
+        }
+    }
+
+    /// Detect the following case
+    ///
+    /// ```text
+    /// fn change_object(mut a: &Ty) {
+    ///     let a = Ty::new();
+    ///     b = &a;
+    /// }
+    /// ```
+    ///
+    /// where the user likely meant to modify the value behind there reference, use `a` as an out
+    /// parameter, instead of mutating the local binding. When encountering this we suggest:
+    ///
+    /// ```text
+    /// fn change_object(a: &'_ mut Ty) {
+    ///     let a = Ty::new();
+    ///     *b = a;
+    /// }
+    /// ```
+    fn annotate_mut_binding_to_immutable_binding(
+        &self,
+        var_hid: HirId,
+        expr: &'tcx Expr<'tcx>,
+    ) -> Option<errors::UnusedAssignSuggestion> {
+        if let hir::Node::Expr(parent) = self.ir.tcx.parent_hir_node(expr.hir_id)
+            && let hir::ExprKind::Assign(_, rhs, _) = parent.kind
+            && let hir::ExprKind::AddrOf(borrow_kind, _mut, inner) = rhs.kind
+            && let hir::BorrowKind::Ref = borrow_kind
+            && let hir::Node::Pat(pat) = self.ir.tcx.hir_node(var_hid)
+            && let hir::Node::Param(hir::Param { ty_span, .. }) =
+                self.ir.tcx.parent_hir_node(pat.hir_id)
+            && let item_id = self.ir.tcx.hir().get_parent_item(pat.hir_id)
+            && let item = self.ir.tcx.hir_owner_node(item_id)
+            && let Some(fn_decl) = item.fn_decl()
+            && let hir::PatKind::Binding(hir::BindingMode::MUT, _hir_id, ident, _) = pat.kind
+            && let Some((lt, mut_ty)) = fn_decl
+                .inputs
+                .iter()
+                .filter_map(|ty| {
+                    if ty.span == *ty_span
+                        && let hir::TyKind::Ref(lt, mut_ty) = ty.kind
+                    {
+                        Some((lt, mut_ty))
+                    } else {
+                        None
+                    }
+                })
+                .next()
+        {
+            let ty_span = if mut_ty.mutbl.is_mut() {
+                // Leave `&'name mut Ty` and `&mut Ty` as they are (#136028).
+                None
+            } else {
+                // `&'name Ty` -> `&'name mut Ty` or `&Ty` -> `&mut Ty`
+                Some(mut_ty.ty.span.shrink_to_lo())
+            };
+            let pre = if lt.ident.span.lo() == lt.ident.span.hi() { "" } else { " " };
+            Some(errors::UnusedAssignSuggestion {
+                ty_span,
+                pre,
+                ty_ref_span: pat.span.until(ident.span),
+                ident_span: expr.span.shrink_to_lo(),
+                expr_ref_span: rhs.span.until(inner.span),
+            })
+        } else {
+            None
         }
     }
 
@@ -1693,15 +1815,23 @@ impl<'tcx> Liveness<'_, 'tcx> {
         suggs
     }
 
-    fn warn_about_dead_assign(&self, spans: Vec<Span>, hir_id: HirId, ln: LiveNode, var: Variable) {
+    fn warn_about_dead_assign(
+        &self,
+        spans: Vec<Span>,
+        hir_id: HirId,
+        ln: LiveNode,
+        var: Variable,
+        suggestion: Option<errors::UnusedAssignSuggestion>,
+    ) {
         if !self.live_on_exit(ln, var)
             && let Some(name) = self.should_warn(var)
         {
+            let help = suggestion.is_none();
             self.ir.tcx.emit_node_span_lint(
                 lint::builtin::UNUSED_ASSIGNMENTS,
                 hir_id,
                 spans,
-                errors::UnusedAssign { name },
+                errors::UnusedAssign { name, suggestion, help },
             );
         }
     }

@@ -1,10 +1,11 @@
 //@ check-fail
-#![feature(repr_simd, platform_intrinsics)]
+#![feature(repr_simd, intrinsics)]
 
-extern "platform-intrinsic" {
-    fn simd_masked_load<M, P, T>(mask: M, pointer: P, values: T) -> T;
-    fn simd_masked_store<M, P, T>(mask: M, pointer: P, values: T) -> ();
-}
+#[rustc_intrinsic]
+unsafe fn simd_masked_load<M, P, T>(mask: M, pointer: P, values: T) -> T;
+
+#[rustc_intrinsic]
+unsafe fn simd_masked_store<M, P, T>(mask: M, pointer: P, values: T) -> ();
 
 #[derive(Copy, Clone)]
 #[repr(simd)]

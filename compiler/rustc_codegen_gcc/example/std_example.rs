@@ -1,5 +1,5 @@
 #![allow(internal_features)]
-#![feature(core_intrinsics, coroutines, coroutine_trait, is_sorted)]
+#![feature(core_intrinsics, coroutines, coroutine_trait, stmt_expr_attributes)]
 
 #[cfg(feature="master")]
 #[cfg(target_arch="x86_64")]
@@ -7,7 +7,7 @@ use std::arch::x86_64::*;
 use std::io::Write;
 use std::ops::Coroutine;
 
-extern {
+extern "C" {
     pub fn printf(format: *const i8, ...) -> i32;
 }
 
@@ -103,7 +103,7 @@ fn main() {
         test_simd();
     }
 
-    Box::pin(move |mut _task_context| {
+    Box::pin(#[coroutine] move |mut _task_context| {
         yield ();
     }).as_mut().resume(0);
 

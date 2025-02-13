@@ -1,12 +1,5 @@
-use rustc_errors::{
-    DiagCtxt, DiagnosticArgValue, DiagnosticBuilder, EmissionGuarantee, IntoDiagnostic,
-    IntoDiagnosticArg, Level,
-};
 use rustc_macros::{Diagnostic, Subdiagnostic};
 use rustc_span::Span;
-use std::borrow::Cow;
-
-use crate::fluent_generated as fluent;
 
 #[derive(Diagnostic)]
 #[diag(codegen_gcc_unknown_ctarget_feature_prefix)]
@@ -24,6 +17,21 @@ pub(crate) struct UnknownCTargetFeature<'a> {
     pub rust_feature: PossibleFeature<'a>,
 }
 
+#[derive(Diagnostic)]
+#[diag(codegen_gcc_unstable_ctarget_feature)]
+#[note]
+pub(crate) struct UnstableCTargetFeature<'a> {
+    pub feature: &'a str,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_gcc_forbidden_ctarget_feature)]
+pub(crate) struct ForbiddenCTargetFeature<'a> {
+    pub feature: &'a str,
+    pub enabled: &'a str,
+    pub reason: &'a str,
+}
+
 #[derive(Subdiagnostic)]
 pub(crate) enum PossibleFeature<'a> {
     #[help(codegen_gcc_possible_feature)]
@@ -31,22 +39,6 @@ pub(crate) enum PossibleFeature<'a> {
     #[help(codegen_gcc_consider_filing_feature_request)]
     None,
 }
-
-struct ExitCode(Option<i32>);
-
-impl IntoDiagnosticArg for ExitCode {
-    fn into_diagnostic_arg(self) -> DiagnosticArgValue {
-        let ExitCode(exit_code) = self;
-        match exit_code {
-            Some(t) => t.into_diagnostic_arg(),
-            None => DiagnosticArgValue::Str(Cow::Borrowed("<signal>")),
-        }
-    }
-}
-
-#[derive(Diagnostic)]
-#[diag(codegen_gcc_lto_not_supported)]
-pub(crate) struct LTONotSupported;
 
 #[derive(Diagnostic)]
 #[diag(codegen_gcc_unwinding_inline_asm)]
@@ -62,15 +54,6 @@ pub(crate) struct InvalidMinimumAlignment {
 }
 
 #[derive(Diagnostic)]
-#[diag(codegen_gcc_tied_target_features)]
-#[help]
-pub(crate) struct TiedTargetFeatures {
-    #[primary_span]
-    pub span: Span,
-    pub features: String,
-}
-
-#[derive(Diagnostic)]
 #[diag(codegen_gcc_copy_bitcode)]
 pub(crate) struct CopyBitcode {
     pub err: std::io::Error,
@@ -80,12 +63,6 @@ pub(crate) struct CopyBitcode {
 #[diag(codegen_gcc_dynamic_linking_with_lto)]
 #[note]
 pub(crate) struct DynamicLinkingWithLTO;
-
-#[derive(Diagnostic)]
-#[diag(codegen_gcc_load_bitcode)]
-pub(crate) struct LoadBitcode {
-    name: String,
-}
 
 #[derive(Diagnostic)]
 #[diag(codegen_gcc_lto_disallowed)]
@@ -99,32 +76,4 @@ pub(crate) struct LtoDylib;
 #[diag(codegen_gcc_lto_bitcode_from_rlib)]
 pub(crate) struct LtoBitcodeFromRlib {
     pub gcc_err: String,
-}
-
-pub(crate) struct TargetFeatureDisableOrEnable<'a> {
-    pub features: &'a [&'a str],
-    pub span: Option<Span>,
-    pub missing_features: Option<MissingFeatures>,
-}
-
-#[derive(Subdiagnostic)]
-#[help(codegen_gcc_missing_features)]
-pub(crate) struct MissingFeatures;
-
-impl<G: EmissionGuarantee> IntoDiagnostic<'_, G> for TargetFeatureDisableOrEnable<'_> {
-    fn into_diagnostic(self, dcx: &'_ DiagCtxt, level: Level) -> DiagnosticBuilder<'_, G> {
-        let mut diag = DiagnosticBuilder::new(
-            dcx,
-            level,
-            fluent::codegen_gcc_target_feature_disable_or_enable
-        );
-        if let Some(span) = self.span {
-            diag.span(span);
-        };
-        if let Some(missing_features) = self.missing_features {
-            diag.subdiagnostic(dcx, missing_features);
-        }
-        diag.arg("features", self.features.join(", "));
-        diag
-    }
 }

@@ -1,7 +1,10 @@
 //@ run-pass
 //@ compile-flags: -C lto
 //@ no-prefer-dynamic
-//@ ignore-emscripten no threads support
+//@ needs-threads
+
+// FIXME(static_mut_refs): this could use an atomic
+#![allow(static_mut_refs)]
 
 use std::thread;
 

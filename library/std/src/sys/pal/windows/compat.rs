@@ -19,9 +19,8 @@
 //! function is called. In the worst case, multiple threads may all end up
 //! importing the same function unnecessarily.
 
-use crate::ffi::{c_void, CStr};
+use crate::ffi::{CStr, c_void};
 use crate::ptr::NonNull;
-use crate::sync::atomic::Ordering;
 use crate::sys::c;
 
 // This uses a static initializer to preload some imported functions.
@@ -38,8 +37,9 @@ use crate::sys::c;
 // file an issue for discussion; currently we don't guarantee any functionality
 // before main.
 // See https://docs.microsoft.com/en-us/cpp/c-runtime-library/crt-initialization?view=msvc-170
+#[cfg(target_vendor = "win7")]
 #[used]
-#[link_section = ".CRT$XCT"]
+#[unsafe(link_section = ".CRT$XCT")]
 static INIT_TABLE_ENTRY: unsafe extern "C" fn() = init;
 
 /// Preload some imported functions.
@@ -52,6 +52,7 @@ static INIT_TABLE_ENTRY: unsafe extern "C" fn() = init;
 /// negative performance impact in practical situations.
 ///
 /// Currently we only preload `WaitOnAddress` and `WakeByAddressSingle`.
+#[cfg(target_vendor = "win7")]
 unsafe extern "C" fn init() {
     // In an exe this code is executed before main() so is single threaded.
     // In a DLL the system's loader lock will be held thereby synchronizing
@@ -111,8 +112,10 @@ impl Module {
     /// (e.g. kernel32 and ntdll).
     pub unsafe fn new(name: &CStr) -> Option<Self> {
         // SAFETY: A CStr is always null terminated.
-        let module = c::GetModuleHandleA(name.as_ptr().cast::<u8>());
-        NonNull::new(module).map(Self)
+        unsafe {
+            let module = c::GetModuleHandleA(name.as_ptr().cast::<u8>());
+            NonNull::new(module).map(Self)
+        }
     }
 
     // Try to get the address of a function.
@@ -155,8 +158,10 @@ macro_rules! compat_fn_with_fallback {
             static PTR: AtomicPtr<c_void> = AtomicPtr::new(load as *mut _);
 
             unsafe extern "system" fn load($($argname: $argtype),*) -> $rettype {
-                let func = load_from_module(Module::new($module));
-                func($($argname),*)
+                unsafe {
+                    let func = load_from_module(Module::new($module));
+                    func($($argname),*)
+                }
             }
 
             fn load_from_module(module: Option<Module>) -> F {
@@ -179,10 +184,13 @@ macro_rules! compat_fn_with_fallback {
 
             #[inline(always)]
             pub unsafe fn call($($argname: $argtype),*) -> $rettype {
-                let func: F = mem::transmute(PTR.load(Ordering::Relaxed));
-                func($($argname),*)
+                unsafe {
+                    let func: F = mem::transmute(PTR.load(Ordering::Relaxed));
+                    func($($argname),*)
+                }
             }
         }
+        #[allow(unused)]
         $(#[$meta])*
         $vis use $symbol::call as $symbol;
     )*)
@@ -190,10 +198,10 @@ macro_rules! compat_fn_with_fallback {
 
 /// Optionally loaded functions.
 ///
-/// Actual loading of the function defers to $load_functions.
+/// Relies on the functions being pre-loaded elsewhere.
+#[cfg(target_vendor = "win7")]
 macro_rules! compat_fn_optional {
-    ($load_functions:expr;
-    $(
+    ($(
         $(#[$meta:meta])*
         $vis:vis fn $symbol:ident($($argname:ident: $argtype:ty),*) $(-> $rettype:ty)?;
     )+) => (
@@ -212,19 +220,22 @@ macro_rules! compat_fn_optional {
 
                 #[inline(always)]
                 pub fn option() -> Option<F> {
-                    // Miri does not understand the way we do preloading
-                    // therefore load the function here instead.
-                    #[cfg(miri)] $load_functions;
                     NonNull::new(PTR.load(Ordering::Relaxed)).map(|f| unsafe { mem::transmute(f) })
                 }
+            }
+            #[inline]
+            pub unsafe extern "system" fn $symbol($($argname: $argtype),*) $(-> $rettype)? {
+                unsafe { $symbol::option().unwrap()($($argname),*) }
             }
         )+
     )
 }
 
 /// Load all needed functions from "api-ms-win-core-synch-l1-2-0".
+#[cfg(target_vendor = "win7")]
 pub(super) fn load_synch_functions() {
     fn try_load() -> Option<()> {
+        use crate::sync::atomic::Ordering;
         const MODULE_NAME: &CStr = c"api-ms-win-core-synch-l1-2-0";
         const WAIT_ON_ADDRESS: &CStr = c"WaitOnAddress";
         const WAKE_BY_ADDRESS_SINGLE: &CStr = c"WakeByAddressSingle";

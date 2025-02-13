@@ -3,18 +3,19 @@
 mod format_like;
 
 use hir::ItemInNs;
+use ide_db::text_edit::TextEdit;
 use ide_db::{
     documentation::{Documentation, HasDocs},
     imports::insert_use::ImportScope,
     ty_filter::TryEnum,
     SnippetCap,
 };
+use stdx::never;
 use syntax::{
     ast::{self, make, AstNode, AstToken},
     SyntaxKind::{BLOCK_EXPR, EXPR_STMT, FOR_EXPR, IF_EXPR, LOOP_EXPR, STMT_LIST, WHILE_EXPR},
     TextRange, TextSize,
 };
-use text_edit::TextEdit;
 
 use crate::{
     completions::postfix::format_like::add_format_like_completions,
@@ -59,20 +60,22 @@ pub(crate) fn complete_postfix(
         None => return,
     };
 
+    let cfg = ctx.config.import_path_config(ctx.is_nightly);
+
     if let Some(drop_trait) = ctx.famous_defs().core_ops_Drop() {
         if receiver_ty.impls_trait(ctx.db, drop_trait, &[]) {
             if let Some(drop_fn) = ctx.famous_defs().core_mem_drop() {
-                if let Some(path) = ctx.module.find_use_path(
-                    ctx.db,
-                    ItemInNs::Values(drop_fn.into()),
-                    ctx.config.prefer_no_std,
-                    ctx.config.prefer_prelude,
-                ) {
+                if let Some(path) =
+                    ctx.module.find_path(ctx.db, ItemInNs::Values(drop_fn.into()), cfg)
+                {
                     cov_mark::hit!(postfix_drop_completion);
                     let mut item = postfix_snippet(
                         "drop",
                         "fn drop(&mut self)",
-                        &format!("{path}($0{receiver_text})", path = path.display(ctx.db)),
+                        &format!(
+                            "{path}($0{receiver_text})",
+                            path = path.display(ctx.db, ctx.edition)
+                        ),
                     );
                     item.set_documentation(drop_fn.docs(ctx.db));
                     item.add_to(acc, ctx.db);
@@ -258,7 +261,7 @@ pub(crate) fn complete_postfix(
 }
 
 fn get_receiver_text(receiver: &ast::Expr, receiver_is_ambiguous_float_literal: bool) -> String {
-    let text = if receiver_is_ambiguous_float_literal {
+    let mut text = if receiver_is_ambiguous_float_literal {
         let text = receiver.syntax().text();
         let without_dot = ..text.len() - TextSize::of('.');
         text.slice(without_dot).to_string()
@@ -267,12 +270,18 @@ fn get_receiver_text(receiver: &ast::Expr, receiver_is_ambiguous_float_literal: 
     };
 
     // The receiver texts should be interpreted as-is, as they are expected to be
-    // normal Rust expressions. We escape '\' and '$' so they don't get treated as
-    // snippet-specific constructs.
-    //
-    // Note that we don't need to escape the other characters that can be escaped,
-    // because they wouldn't be treated as snippet-specific constructs without '$'.
-    text.replace('\\', "\\\\").replace('$', "\\$")
+    // normal Rust expressions.
+    escape_snippet_bits(&mut text);
+    text
+}
+
+/// Escapes `\` and `$` so that they don't get interpreted as snippet-specific constructs.
+///
+/// Note that we don't need to escape the other characters that can be escaped,
+/// because they wouldn't be treated as snippet-specific constructs without '$'.
+fn escape_snippet_bits(text: &mut String) {
+    stdx::replace(text, '\\', "\\\\");
+    stdx::replace(text, '$', "\\$");
 }
 
 fn include_references(initial_element: &ast::Expr) -> (ast::Expr, ast::Expr) {
@@ -285,6 +294,18 @@ fn include_references(initial_element: &ast::Expr) -> (ast::Expr, ast::Expr) {
 
     let mut new_element_opt = initial_element.clone();
 
+    while let Some(parent_deref_element) =
+        resulting_element.syntax().parent().and_then(ast::PrefixExpr::cast)
+    {
+        if parent_deref_element.op_kind() != Some(ast::UnaryOp::Deref) {
+            break;
+        }
+
+        resulting_element = ast::Expr::from(parent_deref_element);
+
+        new_element_opt = make::expr_prefix(syntax::T![*], new_element_opt).into();
+    }
+
     if let Some(first_ref_expr) = resulting_element.syntax().parent().and_then(ast::RefExpr::cast) {
         if let Some(expr) = first_ref_expr.expr() {
             resulting_element = expr;
@@ -293,9 +314,10 @@ fn include_references(initial_element: &ast::Expr) -> (ast::Expr, ast::Expr) {
         while let Some(parent_ref_element) =
             resulting_element.syntax().parent().and_then(ast::RefExpr::cast)
         {
+            let exclusive = parent_ref_element.mut_token().is_some();
             resulting_element = ast::Expr::from(parent_ref_element);
 
-            new_element_opt = make::expr_ref(new_element_opt, false);
+            new_element_opt = make::expr_ref(new_element_opt, exclusive);
         }
     } else {
         // If we do not find any ref expressions, restore
@@ -313,7 +335,9 @@ fn build_postfix_snippet_builder<'ctx>(
 ) -> Option<impl Fn(&str, &str, &str) -> Builder + 'ctx> {
     let receiver_range = ctx.sema.original_range_opt(receiver.syntax())?.range;
     if ctx.source_range().end() < receiver_range.start() {
-        // This shouldn't happen, yet it does. I assume this might be due to an incorrect token mapping.
+        // This shouldn't happen, yet it does. I assume this might be due to an incorrect token
+        // mapping.
+        never!();
         return None;
     }
     let delete_range = TextRange::new(receiver_range.start(), ctx.source_range().end());
@@ -327,8 +351,12 @@ fn build_postfix_snippet_builder<'ctx>(
     ) -> impl Fn(&str, &str, &str) -> Builder + 'ctx {
         move |label, detail, snippet| {
             let edit = TextEdit::replace(delete_range, snippet.to_owned());
-            let mut item =
-                CompletionItem::new(CompletionItemKind::Snippet, ctx.source_range(), label);
+            let mut item = CompletionItem::new(
+                CompletionItemKind::Snippet,
+                ctx.source_range(),
+                label,
+                ctx.edition,
+            );
             item.detail(detail).snippet_edit(cap, edit);
             let postfix_match = if ctx.original_token.text() == label {
                 cov_mark::hit!(postfix_exact_match_is_high_priority);
@@ -373,17 +401,12 @@ fn add_custom_postfix_completions(
 
 #[cfg(test)]
 mod tests {
-    use expect_test::{expect, Expect};
+    use expect_test::expect;
 
     use crate::{
-        tests::{check_edit, check_edit_with_config, completion_list, TEST_CONFIG},
+        tests::{check, check_edit, check_edit_with_config, TEST_CONFIG},
         CompletionConfig, Snippet,
     };
-
-    fn check(ra_fixture: &str, expect: Expect) {
-        let actual = completion_list(ra_fixture);
-        expect.assert_eq(&actual)
-    }
 
     #[test]
     fn postfix_completion_works_for_trivial_path_expression() {
@@ -395,21 +418,21 @@ fn main() {
 }
 "#,
             expect![[r#"
-                sn box    Box::new(expr)
-                sn call   function(expr)
-                sn dbg    dbg!(expr)
-                sn dbgr   dbg!(&expr)
-                sn deref  *expr
-                sn if     if expr {}
-                sn let    let
-                sn letm   let mut
-                sn match  match expr {}
-                sn not    !expr
-                sn ref    &expr
-                sn refm   &mut expr
-                sn return return expr
-                sn unsafe unsafe {}
-                sn while  while expr {}
+                sn box  Box::new(expr)
+                sn call function(expr)
+                sn dbg      dbg!(expr)
+                sn dbgr    dbg!(&expr)
+                sn deref         *expr
+                sn if       if expr {}
+                sn let             let
+                sn letm        let mut
+                sn match match expr {}
+                sn not           !expr
+                sn ref           &expr
+                sn refm      &mut expr
+                sn return  return expr
+                sn unsafe    unsafe {}
+                sn while while expr {}
             "#]],
         );
     }
@@ -428,19 +451,19 @@ fn main() {
 }
 "#,
             expect![[r#"
-                sn box    Box::new(expr)
-                sn call   function(expr)
-                sn dbg    dbg!(expr)
-                sn dbgr   dbg!(&expr)
-                sn deref  *expr
-                sn if     if expr {}
-                sn match  match expr {}
-                sn not    !expr
-                sn ref    &expr
-                sn refm   &mut expr
-                sn return return expr
-                sn unsafe unsafe {}
-                sn while  while expr {}
+                sn box  Box::new(expr)
+                sn call function(expr)
+                sn dbg      dbg!(expr)
+                sn dbgr    dbg!(&expr)
+                sn deref         *expr
+                sn if       if expr {}
+                sn match match expr {}
+                sn not           !expr
+                sn ref           &expr
+                sn refm      &mut expr
+                sn return  return expr
+                sn unsafe    unsafe {}
+                sn while while expr {}
             "#]],
         );
     }
@@ -455,18 +478,18 @@ fn main() {
 }
 "#,
             expect![[r#"
-                sn box    Box::new(expr)
-                sn call   function(expr)
-                sn dbg    dbg!(expr)
-                sn dbgr   dbg!(&expr)
-                sn deref  *expr
-                sn let    let
-                sn letm   let mut
-                sn match  match expr {}
-                sn ref    &expr
-                sn refm   &mut expr
-                sn return return expr
-                sn unsafe unsafe {}
+                sn box  Box::new(expr)
+                sn call function(expr)
+                sn dbg      dbg!(expr)
+                sn dbgr    dbg!(&expr)
+                sn deref         *expr
+                sn let             let
+                sn letm        let mut
+                sn match match expr {}
+                sn ref           &expr
+                sn refm      &mut expr
+                sn return  return expr
+                sn unsafe    unsafe {}
             "#]],
         )
     }
@@ -481,21 +504,21 @@ fn main() {
 }
 "#,
             expect![[r#"
-                sn box    Box::new(expr)
-                sn call   function(expr)
-                sn dbg    dbg!(expr)
-                sn dbgr   dbg!(&expr)
-                sn deref  *expr
-                sn if     if expr {}
-                sn let    let
-                sn letm   let mut
-                sn match  match expr {}
-                sn not    !expr
-                sn ref    &expr
-                sn refm   &mut expr
-                sn return return expr
-                sn unsafe unsafe {}
-                sn while  while expr {}
+                sn box  Box::new(expr)
+                sn call function(expr)
+                sn dbg      dbg!(expr)
+                sn dbgr    dbg!(&expr)
+                sn deref         *expr
+                sn if       if expr {}
+                sn let             let
+                sn letm        let mut
+                sn match match expr {}
+                sn not           !expr
+                sn ref           &expr
+                sn refm      &mut expr
+                sn return  return expr
+                sn unsafe    unsafe {}
+                sn while while expr {}
             "#]],
         );
     }
@@ -657,7 +680,7 @@ fn main() {
         check_edit(
             "unsafe",
             r#"fn main() { let x = true else {panic!()}.$0}"#,
-            r#"fn main() { let x = true else {panic!()}.unsafe}"#,
+            r#"fn main() { let x = true else {panic!()}.unsafe $0}"#,
         );
     }
 
@@ -838,6 +861,44 @@ fn test() {
 }
 "#,
             expect![[r#""#]],
+        );
+    }
+
+    #[test]
+    fn mut_ref_consuming() {
+        check_edit(
+            "call",
+            r#"
+fn main() {
+    let mut x = &mut 2;
+    &mut x.$0;
+}
+"#,
+            r#"
+fn main() {
+    let mut x = &mut 2;
+    ${1}(&mut x);
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn deref_consuming() {
+        check_edit(
+            "call",
+            r#"
+fn main() {
+    let mut x = &mut 2;
+    &mut *x.$0;
+}
+"#,
+            r#"
+fn main() {
+    let mut x = &mut 2;
+    ${1}(&mut *x);
+}
+"#,
         );
     }
 }

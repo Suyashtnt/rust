@@ -51,7 +51,7 @@ pub struct Empty;
 /// ```
 #[must_use]
 #[stable(feature = "rust1", since = "1.0.0")]
-#[rustc_const_unstable(feature = "const_io_structs", issue = "78812")]
+#[rustc_const_stable(feature = "const_io_structs", since = "1.79.0")]
 pub const fn empty() -> Empty {
     Empty
 }
@@ -173,7 +173,7 @@ pub struct Repeat {
 /// ```
 #[must_use]
 #[stable(feature = "rust1", since = "1.0.0")]
-#[rustc_const_unstable(feature = "const_io_structs", issue = "78812")]
+#[rustc_const_stable(feature = "const_io_structs", since = "1.79.0")]
 pub const fn repeat(byte: u8) -> Repeat {
     Repeat { byte }
 }
@@ -186,6 +186,13 @@ impl Read for Repeat {
             *slot = self.byte;
         }
         Ok(buf.len())
+    }
+
+    fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        for slot in &mut *buf {
+            *slot = self.byte;
+        }
+        Ok(())
     }
 
     fn read_buf(&mut self, mut buf: BorrowedCursor<'_>) -> io::Result<()> {
@@ -202,6 +209,10 @@ impl Read for Repeat {
         }
 
         Ok(())
+    }
+
+    fn read_buf_exact(&mut self, buf: BorrowedCursor<'_>) -> io::Result<()> {
+        self.read_buf(buf)
     }
 
     /// This function is not supported by `io::Repeat`, because there's no end of its data
@@ -276,7 +287,7 @@ pub struct Sink;
 /// ```
 #[must_use]
 #[stable(feature = "rust1", since = "1.0.0")]
-#[rustc_const_unstable(feature = "const_io_structs", issue = "78812")]
+#[rustc_const_stable(feature = "const_io_structs", since = "1.79.0")]
 pub const fn sink() -> Sink {
     Sink
 }

@@ -143,14 +143,14 @@ pub struct FixtureWithProjectMeta {
     /// Specifies LLVM data layout to be used.
     ///
     /// You probably don't want to manually specify this. See LLVM manual for the
-    /// syntax, if you must: https://llvm.org/docs/LangRef.html#data-layout
+    /// syntax, if you must: <https://llvm.org/docs/LangRef.html#data-layout>
     pub target_data_layout: String,
 }
 
 impl FixtureWithProjectMeta {
     /// Parses text which looks like this:
     ///
-    ///  ```not_rust
+    ///  ```text
     ///  //- some meta
     ///  line 1
     ///  line 2
@@ -159,7 +159,7 @@ impl FixtureWithProjectMeta {
     ///
     /// Fixture can also start with a proc_macros and minicore declaration (in that order):
     ///
-    /// ```
+    /// ```text
     /// //- toolchain: nightly
     /// //- proc_macros: identity
     /// //- minicore: sized
@@ -168,7 +168,7 @@ impl FixtureWithProjectMeta {
     /// That will set toolchain to nightly and include predefined proc macros and a subset of
     /// `libcore` into the fixture, see `minicore.rs` for what's available. Note that toolchain
     /// defaults to stable.
-    pub fn parse(ra_fixture: &str) -> Self {
+    pub fn parse(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> Self {
         let fixture = trim_indent(ra_fixture);
         let mut fixture = fixture.as_str();
         let mut toolchain = None;
@@ -186,7 +186,7 @@ impl FixtureWithProjectMeta {
 
         if let Some(meta) = fixture.strip_prefix("//- target_data_layout:") {
             let (meta, remain) = meta.split_once('\n').unwrap();
-            target_data_layout = meta.trim().to_owned();
+            meta.trim().clone_into(&mut target_data_layout);
             fixture = remain;
         }
 
@@ -450,7 +450,7 @@ impl MiniCore {
         }
 
         if !active_regions.is_empty() {
-            panic!("unclosed regions: {:?} Add an `endregion` comment", active_regions);
+            panic!("unclosed regions: {active_regions:?} Add an `endregion` comment");
         }
 
         for flag in &self.valid_flags {

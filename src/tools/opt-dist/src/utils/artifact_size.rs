@@ -9,14 +9,14 @@ use crate::environment::Environment;
 use crate::utils::io::get_files_from_dir;
 
 pub fn print_binary_sizes(env: &Environment) -> anyhow::Result<()> {
-    use humansize::format_size;
-    use humansize::BINARY;
     use std::fmt::Write;
+
+    use humansize::{BINARY, format_size};
 
     let root = env.build_artifacts().join("stage2");
 
     let mut files = get_files_from_dir(&root.join("bin"), None)?;
-    files.extend(get_files_from_dir(&root.join("lib"), Some(".so"))?);
+    files.extend(get_files_from_dir(&root.join("lib"), None)?);
     files.sort_unstable();
 
     let items: Vec<_> = files

@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 
-use serde::Serialize;
-
 use crate::{ErrorCode, Request, RequestId, Response, ResponseError};
 
 /// Manages the set of pending requests, both incoming and outgoing.
@@ -37,7 +35,7 @@ impl<I> Incoming<I> {
     }
 
     pub fn cancel(&mut self, id: RequestId) -> Option<Response> {
-        let _data = self.complete(id.clone())?;
+        let _data = self.complete(&id)?;
         let error = ResponseError {
             code: ErrorCode::RequestCanceled as i32,
             message: "canceled by client".to_owned(),
@@ -46,8 +44,8 @@ impl<I> Incoming<I> {
         Some(Response { id, result: None, error: Some(error) })
     }
 
-    pub fn complete(&mut self, id: RequestId) -> Option<I> {
-        self.pending.remove(&id)
+    pub fn complete(&mut self, id: &RequestId) -> Option<I> {
+        self.pending.remove(id)
     }
 
     pub fn is_completed(&self, id: &RequestId) -> bool {
@@ -56,7 +54,7 @@ impl<I> Incoming<I> {
 }
 
 impl<O> Outgoing<O> {
-    pub fn register<P: Serialize>(&mut self, method: String, params: P, data: O) -> Request {
+    pub fn register<P: serde::Serialize>(&mut self, method: String, params: P, data: O) -> Request {
         let id = RequestId::from(self.next_id);
         self.pending.insert(id.clone(), data);
         self.next_id += 1;

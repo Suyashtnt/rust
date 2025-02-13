@@ -13,8 +13,9 @@ LL | fn underscore_lifetime<'_>(str1: &'_ str, str2: &'_ str) -> &'_ str {
    = help: this function's return type contains a borrowed value, but the signature does not say whether it is borrowed from `str1` or `str2`
 help: consider introducing a named lifetime parameter
    |
-LL | fn underscore_lifetime<'a, '_>(str1: &'a str, str2: &'a str) -> &'a str {
-   |                        +++            ~~             ~~          ~~
+LL - fn underscore_lifetime<'_>(str1: &'_ str, str2: &'_ str) -> &'_ str {
+LL + fn underscore_lifetime<'a, '_>(str1: &'a str, str2: &'a str) -> &'a str {
+   |
 
 error[E0637]: `&` without an explicit lifetime name cannot be used here
   --> $DIR/E0637.rs:13:13
@@ -27,25 +28,7 @@ help: consider introducing a higher-ranked lifetime here
 LL |     T: for<'a> Into<&'a u32>,
    |        +++++++       ++
 
-error: lifetime may not live long enough
-  --> $DIR/E0637.rs:5:9
-   |
-LL | fn underscore_lifetime<'_>(str1: &'_ str, str2: &'_ str) -> &'_ str {
-   |                                  - let's call the lifetime of this reference `'1`
-...
-LL |         str1
-   |         ^^^^ returning this value requires that `'1` must outlive `'static`
-
-error: lifetime may not live long enough
-  --> $DIR/E0637.rs:7:9
-   |
-LL | fn underscore_lifetime<'_>(str1: &'_ str, str2: &'_ str) -> &'_ str {
-   |                                                 - let's call the lifetime of this reference `'2`
-...
-LL |         str2
-   |         ^^^^ returning this value requires that `'2` must outlive `'static`
-
-error: aborting due to 5 previous errors
+error: aborting due to 3 previous errors
 
 Some errors have detailed explanations: E0106, E0637.
 For more information about an error, try `rustc --explain E0106`.

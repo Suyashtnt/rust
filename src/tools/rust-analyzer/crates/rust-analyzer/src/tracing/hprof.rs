@@ -1,8 +1,8 @@
 //! Consumer of `tracing` data, which prints a hierarchical profile.
 //!
-//! Based on https://github.com/davidbarsky/tracing-tree, but does less, while
+//! Based on <https://github.com/davidbarsky/tracing-tree>, but does less, while
 //! actually printing timings for spans by default. The code here is vendored from
-//! https://github.com/matklad/tracing-span-tree.
+//! <https://github.com/matklad/tracing-span-tree>.
 //!
 //! Usage:
 //!
@@ -33,6 +33,7 @@
 
 use std::{
     fmt::Write,
+    marker::PhantomData,
     mem,
     time::{Duration, Instant},
 };
@@ -50,50 +51,42 @@ use tracing_subscriber::{
     Layer, Registry,
 };
 
-use crate::tracing::hprof;
-
-pub fn init(spec: &str) {
-    let (write_filter, allowed_names) = WriteFilter::from_spec(spec);
-
-    // this filter the first pass for `tracing`: these are all the "profiling" spans, but things like
-    // span depth or duration are not filtered here: that only occurs at write time.
-    let profile_filter = filter::filter_fn(move |metadata| {
-        let allowed = match &allowed_names {
-            Some(names) => names.contains(metadata.name()),
-            None => true,
-        };
-
-        metadata.is_span()
-            && allowed
-            && metadata.level() >= &Level::INFO
-            && !metadata.target().starts_with("salsa")
-            && !metadata.target().starts_with("chalk")
-    });
-
-    let layer = hprof::SpanTree::default()
-        .aggregate(true)
-        .spec_filter(write_filter)
-        .with_filter(profile_filter);
-
-    let subscriber = Registry::default().with(layer);
-    tracing::subscriber::set_global_default(subscriber).unwrap();
+pub fn init(spec: &str) -> tracing::subscriber::DefaultGuard {
+    let subscriber = Registry::default().with(SpanTree::new(spec));
+    tracing::subscriber::set_default(subscriber)
 }
 
-#[derive(Default, Debug)]
-pub(crate) struct SpanTree {
+#[derive(Debug)]
+pub(crate) struct SpanTree<S> {
     aggregate: bool,
     write_filter: WriteFilter,
+    _inner: PhantomData<fn(S)>,
 }
 
-impl SpanTree {
-    /// Merge identical sibling spans together.
-    pub(crate) fn aggregate(self, yes: bool) -> SpanTree {
-        SpanTree { aggregate: yes, ..self }
-    }
+impl<S> SpanTree<S>
+where
+    S: Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+{
+    pub(crate) fn new(spec: &str) -> impl Layer<S> {
+        let (write_filter, allowed_names) = WriteFilter::from_spec(spec);
 
-    /// Add a write-time filter for span duration or tree depth.
-    pub(crate) fn spec_filter(self, write_filter: WriteFilter) -> SpanTree {
-        SpanTree { write_filter, ..self }
+        // this filter the first pass for `tracing`: these are all the "profiling" spans, but things like
+        // span depth or duration are not filtered here: that only occurs at write time.
+        let profile_filter = filter::filter_fn(move |metadata| {
+            let allowed = match &allowed_names {
+                Some(names) => names.contains(metadata.name()),
+                None => true,
+            };
+
+            allowed
+                && metadata.is_span()
+                && metadata.level() >= &Level::INFO
+                && !metadata.target().starts_with("salsa")
+                && metadata.name() != "compute_exhaustiveness_and_usefulness"
+                && !metadata.target().starts_with("chalk")
+        });
+
+        Self { aggregate: true, write_filter, _inner: PhantomData }.with_filter(profile_filter)
     }
 }
 
@@ -127,13 +120,13 @@ pub struct DataVisitor<'a> {
     string: &'a mut String,
 }
 
-impl<'a> Visit for DataVisitor<'a> {
+impl Visit for DataVisitor<'_> {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         write!(self.string, "{} = {:?} ", field.name(), value).unwrap();
     }
 }
 
-impl<S> Layer<S> for SpanTree
+impl<S> Layer<S> for SpanTree<S>
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
 {
@@ -196,7 +189,7 @@ impl Node {
                 let _ = write!(out, " ({} calls)", self.count);
             }
 
-            eprintln!("{}", out);
+            eprintln!("{out}");
 
             for child in &self.children {
                 child.go(level + 1, filter)

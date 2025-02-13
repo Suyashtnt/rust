@@ -134,7 +134,7 @@ fn main() {
     //~^ ERROR: this operation has no effect
     f(0 + if b { 1 } else { 2 } + 3);
     //~^ ERROR: this operation has no effect
-    
+
     const _: i32 = { 2 * 4 } + 0 + 3;
     //~^ ERROR: this operation has no effect
     const _: i32 = 0 + { 1 + 2 * 3 } + 3;
@@ -211,4 +211,48 @@ fn issue_12050() {
         let _: i32 = **&&*&x + 0;
         //~^ ERROR: this operation has no effect
     }
+}
+
+fn issue_13470() {
+    let x = 1i32;
+    let y = 1i32;
+    // Removes the + 0i32 while keeping the parentheses around x + y so the cast operation works
+    let _: u64 = (x + y + 0i32) as u64;
+    //~^ ERROR: this operation has no effect
+    // both of the next two lines should look the same after rustfix
+    let _: u64 = 1u64 & (x + y + 0i32) as u64;
+    //~^ ERROR: this operation has no effect
+    // Same as above, but with extra redundant parenthesis
+    let _: u64 = 1u64 & ((x + y) + 0i32) as u64;
+    //~^ ERROR: this operation has no effect
+    // Should maintain parenthesis even if the surrounding expr has the same precedence
+    let _: u64 = 5u64 + ((x + y) + 0i32) as u64;
+    //~^ ERROR: this operation has no effect
+
+    // If we don't maintain the parens here, the behavior changes
+    let _ = -(x + y + 0i32);
+    //~^ ERROR: this operation has no effect
+    // Similarly, we need to maintain parens here
+    let _ = -(x / y / 1i32);
+    //~^ ERROR: this operation has no effect
+    // Maintain parenthesis if the parent expr is of higher precedence
+    let _ = 2i32 * (x + y + 0i32);
+    //~^ ERROR: this operation has no effect
+    // Maintain parenthesis if the parent expr is the same precedence
+    // as not all operations are associative
+    let _ = 2i32 - (x - y - 0i32);
+    //~^ ERROR: this operation has no effect
+    // But make sure that inner parens still exist
+    let z = 1i32;
+    let _ = 2 + (x + (y * z) + 0);
+    //~^ ERROR: this operation has no effect
+    // Maintain parenthesis if the parent expr is of lower precedence
+    // This is for clarity, and clippy will not warn on these being unnecessary
+    let _ = 2i32 + (x * y * 1i32);
+    //~^ ERROR: this operation has no effect
+
+    let x = 1i16;
+    let y = 1i16;
+    let _: u64 = 1u64 + ((x as i32 + y as i32) as u64 + 0u64);
+    //~^ ERROR: this operation has no effect
 }
