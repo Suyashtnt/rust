@@ -3,6 +3,7 @@ use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::source::snippet;
 use clippy_utils::sugg::Sugg;
 use clippy_utils::ty::is_copy;
+use clippy_utils::usage::local_used_in;
 use clippy_utils::{get_enclosing_block, higher, path_to_local, sugg};
 use rustc_ast::ast;
 use rustc_errors::Applicability;
@@ -63,8 +64,9 @@ pub(super) fn check<'tcx>(
                             && get_slice_like_element_ty(cx, cx.typeck_results().expr_ty(base_right)).is_some()
                             && let Some((start_left, offset_left)) = get_details_from_idx(cx, idx_left, &starts)
                             && let Some((start_right, offset_right)) = get_details_from_idx(cx, idx_right, &starts)
-
-                            // Source and destination must be different
+                            && !local_used_in(cx, canonical_id, base_left)
+                            && !local_used_in(cx, canonical_id, base_right)
+							// Source and destination must be different
                             && path_to_local(base_left) != path_to_local(base_right)
                         {
                             Some((
@@ -207,7 +209,7 @@ fn build_manual_memcpy_suggestion<'tcx>(
 #[derive(Clone)]
 struct MinifyingSugg<'a>(Sugg<'a>);
 
-impl<'a> Display for MinifyingSugg<'a> {
+impl Display for MinifyingSugg<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
     }
@@ -408,13 +410,13 @@ fn get_assignments<'a, 'tcx>(
     stmts
         .iter()
         .filter_map(move |stmt| match stmt.kind {
-            StmtKind::Local(..) | StmtKind::Item(..) => None,
+            StmtKind::Let(..) | StmtKind::Item(..) => None,
             StmtKind::Expr(e) | StmtKind::Semi(e) => Some(e),
         })
         .chain(*expr)
         .filter(move |e| {
             if let ExprKind::AssignOp(_, place, _) = e.kind {
-                path_to_local(place).map_or(false, |id| {
+                path_to_local(place).is_some_and(|id| {
                     !loop_counters
                         .iter()
                         // skip the first item which should be `StartKind::Range`
@@ -470,7 +472,7 @@ fn is_array_length_equal_to_range(cx: &LateContext<'_>, start: &Expr<'_>, end: &
     let arr_ty = cx.typeck_results().expr_ty(arr).peel_refs();
 
     if let ty::Array(_, s) = arr_ty.kind() {
-        let size: u128 = if let Some(size) = s.try_eval_target_usize(cx.tcx, cx.param_env) {
+        let size: u128 = if let Some(size) = s.try_to_target_usize(cx.tcx) {
             size.into()
         } else {
             return false;

@@ -16,7 +16,8 @@ use base_db::CrateId;
 use chalk_ir::Mutability;
 use either::Either;
 use hir_def::{
-    hir::{BindingId, Expr, ExprId, Ordering, PatId},
+    expr_store::Body,
+    hir::{BindingAnnotation, BindingId, Expr, ExprId, Ordering, PatId},
     DefWithBodyId, FieldId, StaticId, TupleFieldId, UnionId, VariantId,
 };
 use la_arena::{Arena, ArenaMap, Idx, RawIdx};
@@ -158,7 +159,10 @@ impl<V, T> ProjectionElem<V, T> {
                     subst.at(Interner, 0).assert_ty_ref(Interner).clone()
                 }
                 _ => {
-                    never!("Overloaded deref on type {} is not a projection", base.display(db));
+                    never!(
+                        "Overloaded deref on type {} is not a projection",
+                        base.display(db, db.crate_graph()[krate].edition)
+                    );
                     TyKind::Error.intern(Interner)
                 }
             },
@@ -181,8 +185,8 @@ impl<V, T> ProjectionElem<V, T> {
                         never!("Out of bound tuple field");
                         TyKind::Error.intern(Interner)
                     }),
-                _ => {
-                    never!("Only tuple has tuple field");
+                ty => {
+                    never!("Only tuple has tuple field: {:?}", ty);
                     TyKind::Error.intern(Interner)
                 }
             },
@@ -633,6 +637,7 @@ pub enum TerminatorKind {
     },
 }
 
+// Order of variants in this enum matter: they are used to compare borrow kinds.
 #[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, Ord)]
 pub enum BorrowKind {
     /// Data must be immutable and is aliasable.
@@ -659,66 +664,34 @@ pub enum BorrowKind {
     /// We can also report errors with this kind of borrow differently.
     Shallow,
 
-    /// Data must be immutable but not aliasable. This kind of borrow
-    /// cannot currently be expressed by the user and is used only in
-    /// implicit closure bindings. It is needed when the closure is
-    /// borrowing or mutating a mutable referent, e.g.:
-    /// ```
-    /// let mut z = 3;
-    /// let x: &mut isize = &mut z;
-    /// let y = || *x += 5;
-    /// ```
-    /// If we were to try to translate this closure into a more explicit
-    /// form, we'd encounter an error with the code as written:
-    /// ```compile_fail,E0594
-    /// struct Env<'a> { x: &'a &'a mut isize }
-    /// let mut z = 3;
-    /// let x: &mut isize = &mut z;
-    /// let y = (&mut Env { x: &x }, fn_ptr);  // Closure is pair of env and fn
-    /// fn fn_ptr(env: &mut Env) { **env.x += 5; }
-    /// ```
-    /// This is then illegal because you cannot mutate an `&mut` found
-    /// in an aliasable location. To solve, you'd have to translate with
-    /// an `&mut` borrow:
-    /// ```compile_fail,E0596
-    /// struct Env<'a> { x: &'a mut &'a mut isize }
-    /// let mut z = 3;
-    /// let x: &mut isize = &mut z;
-    /// let y = (&mut Env { x: &mut x }, fn_ptr); // changed from &x to &mut x
-    /// fn fn_ptr(env: &mut Env) { **env.x += 5; }
-    /// ```
-    /// Now the assignment to `**env.x` is legal, but creating a
-    /// mutable pointer to `x` is not because `x` is not mutable. We
-    /// could fix this by declaring `x` as `let mut x`. This is ok in
-    /// user code, if awkward, but extra weird for closures, since the
-    /// borrow is hidden.
-    ///
-    /// So we introduce a "unique imm" borrow -- the referent is
-    /// immutable, but not aliasable. This solves the problem. For
-    /// simplicity, we don't give users the way to express this
-    /// borrow, it's just used when translating closures.
-    Unique,
-
     /// Data is mutable and not aliasable.
-    Mut {
-        /// `true` if this borrow arose from method-call auto-ref
-        /// (i.e., `adjustment::Adjust::Borrow`).
-        allow_two_phase_borrow: bool,
-    },
+    Mut { kind: MutBorrowKind },
+}
+
+// Order of variants in this enum matter: they are used to compare borrow kinds.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, Ord)]
+pub enum MutBorrowKind {
+    /// Data must be immutable but not aliasable. This kind of borrow cannot currently
+    /// be expressed by the user and is used only in implicit closure bindings.
+    ClosureCapture,
+    Default,
+    /// This borrow arose from method-call auto-ref
+    /// (i.e., adjustment::Adjust::Borrow).
+    TwoPhasedBorrow,
 }
 
 impl BorrowKind {
     fn from_hir(m: hir_def::type_ref::Mutability) -> Self {
         match m {
             hir_def::type_ref::Mutability::Shared => BorrowKind::Shared,
-            hir_def::type_ref::Mutability::Mut => BorrowKind::Mut { allow_two_phase_borrow: false },
+            hir_def::type_ref::Mutability::Mut => BorrowKind::Mut { kind: MutBorrowKind::Default },
         }
     }
 
     fn from_chalk(m: Mutability) -> Self {
         match m {
             Mutability::Not => BorrowKind::Shared,
-            Mutability::Mut => BorrowKind::Mut { allow_two_phase_borrow: false },
+            Mutability::Mut => BorrowKind::Mut { kind: MutBorrowKind::Default },
         }
     }
 }
@@ -864,7 +837,9 @@ pub enum CastKind {
     PointerFromExposedAddress,
     /// All sorts of pointer-to-pointer casts. Note that reference-to-raw-ptr casts are
     /// translated into `&raw mut/const *r`, i.e., they are not actually casts.
-    Pointer(PointerCast),
+    PtrToPtr,
+    /// Pointer related casts that are done by coercions.
+    PointerCoercion(PointerCast),
     /// Cast into a dyn* object.
     DynStar,
     IntToInt,
@@ -904,7 +879,8 @@ pub enum Rvalue {
     ///
     /// **Needs clarification**: Are there weird additional semantics here related to the runtime
     /// nature of this operation?
-    //ThreadLocalRef(DefId),
+    // ThreadLocalRef(DefId),
+    ThreadLocalRef(std::convert::Infallible),
 
     /// Creates a pointer with the indicated mutability to the place.
     ///
@@ -913,7 +889,8 @@ pub enum Rvalue {
     ///
     /// Like with references, the semantics of this operation are heavily dependent on the aliasing
     /// model.
-    //AddressOf(Mutability, Place),
+    // AddressOf(Mutability, Place),
+    AddressOf(std::convert::Infallible),
 
     /// Yields the length of the place, as a `usize`.
     ///
@@ -944,6 +921,7 @@ pub enum Rvalue {
     /// * The remaining operations accept signed integers, unsigned integers, or floats with
     ///   matching types and return a value of that type.
     //BinaryOp(BinOp, Box<(Operand, Operand)>),
+    BinaryOp(std::convert::Infallible),
 
     /// Same as `BinaryOp`, but yields `(T, bool)` with a `bool` indicating an error condition.
     ///
@@ -963,6 +941,7 @@ pub enum Rvalue {
 
     /// Computes a value as described by the operation.
     //NullaryOp(NullOp, Ty),
+    NullaryOp(std::convert::Infallible),
 
     /// Exactly like `BinaryOp`, but less operands.
     ///
@@ -1121,6 +1100,10 @@ impl MirBody {
                                     for_operand(op, &mut f, &mut self.projection_store);
                                 }
                             }
+                            Rvalue::ThreadLocalRef(n)
+                            | Rvalue::AddressOf(n)
+                            | Rvalue::BinaryOp(n)
+                            | Rvalue::NullaryOp(n) => match *n {},
                         }
                     }
                     StatementKind::FakeRead(p) | StatementKind::Deinit(p) => {
@@ -1198,7 +1181,23 @@ impl MirBody {
 pub enum MirSpan {
     ExprId(ExprId),
     PatId(PatId),
+    BindingId(BindingId),
+    SelfParam,
     Unknown,
+}
+
+impl MirSpan {
+    pub fn is_ref_span(&self, body: &Body) -> bool {
+        match *self {
+            MirSpan::ExprId(expr) => matches!(body[expr], Expr::Ref { .. }),
+            // FIXME: Figure out if this is correct wrt. match ergonomics.
+            MirSpan::BindingId(binding) => matches!(
+                body.bindings[binding].mode,
+                BindingAnnotation::Ref | BindingAnnotation::RefMut
+            ),
+            MirSpan::PatId(_) | MirSpan::SelfParam | MirSpan::Unknown => false,
+        }
+    }
 }
 
 impl_from!(ExprId, PatId for MirSpan);

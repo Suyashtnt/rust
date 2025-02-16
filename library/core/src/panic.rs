@@ -6,14 +6,15 @@ mod location;
 mod panic_info;
 mod unwind_safe;
 
-use crate::any::Any;
-
 #[stable(feature = "panic_hooks", since = "1.10.0")]
 pub use self::location::Location;
 #[stable(feature = "panic_hooks", since = "1.10.0")]
 pub use self::panic_info::PanicInfo;
+#[stable(feature = "panic_info_message", since = "1.81.0")]
+pub use self::panic_info::PanicMessage;
 #[stable(feature = "catch_unwind", since = "1.9.0")]
 pub use self::unwind_safe::{AssertUnwindSafe, RefUnwindSafe, UnwindSafe};
+use crate::any::Any;
 
 #[doc(hidden)]
 #[unstable(feature = "edition_panic", issue = "none", reason = "use panic!() instead")]
@@ -27,9 +28,9 @@ pub macro panic_2015 {
     ($msg:literal $(,)?) => (
         $crate::panicking::panic($msg)
     ),
-    // Use `panic_str` instead of `panic_display::<&str>` for non_fmt_panic lint.
+    // Use `panic_str_2015` instead of `panic_display::<&str>` for non_fmt_panic lint.
     ($msg:expr $(,)?) => ({
-        $crate::panicking::panic_str($msg);
+        $crate::panicking::panic_str_2015($msg);
     }),
     // Special-case the single-argument case for const_panic.
     ("{}", $arg:expr $(,)?) => ({
@@ -139,41 +140,29 @@ pub macro unreachable_2021 {
     ),
 }
 
-/// Like `assert_unsafe_precondition!` the defining features of this macro are that its
-/// checks are enabled when they are monomorphized with debug assertions enabled, and upon failure
-/// a non-unwinding panic is launched so that failures cannot compromise unwind safety.
+/// Invokes a closure, aborting if the closure unwinds.
 ///
-/// But there are many differences from `assert_unsafe_precondition!`. This macro does not use
-/// `const_eval_select` internally, and therefore it is sound to call this with an expression
-/// that evaluates to `false`. Also unlike `assert_unsafe_precondition!` the condition being
-/// checked here is not put in an outlined function. If the check compiles to a lot of IR, this
-/// can cause code bloat if the check is monomorphized many times. But it also means that the checks
-/// from this macro can be deduplicated or otherwise optimized out.
+/// When compiled with aborting panics, this function is effectively a no-op.
+/// With unwinding panics, an unwind results in another call into the panic
+/// hook followed by a process abort.
 ///
-/// In general, this macro should be used to check all public-facing preconditions. But some
-/// preconditions may be called too often or instantiated too often to make the overhead of the
-/// checks tolerable. In such cases, place `#[cfg(debug_assertions)]` on the macro call. That will
-/// disable the check in our precompiled standard library, but if a user wishes, they can still
-/// enable the check by recompiling the standard library with debug assertions enabled.
-#[doc(hidden)]
-#[unstable(feature = "panic_internals", issue = "none")]
-#[allow_internal_unstable(panic_internals, delayed_debug_assertions)]
-#[rustc_macro_transparency = "semitransparent"]
-pub macro debug_assert_nounwind {
-    ($cond:expr $(,)?) => {
-        if $crate::intrinsics::debug_assertions() {
-            if !$cond {
-                $crate::panicking::panic_nounwind($crate::concat!("assertion failed: ", $crate::stringify!($cond)));
-            }
-        }
-    },
-    ($cond:expr, $message:expr) => {
-        if $crate::intrinsics::debug_assertions() {
-            if !$cond {
-                $crate::panicking::panic_nounwind($message);
-            }
-        }
-    },
+/// # Notes
+///
+/// Instead of using this function, code should attempt to support unwinding.
+/// Implementing [`Drop`] allows you to restore invariants uniformly in both
+/// return and unwind paths.
+///
+/// If an unwind can lead to logical issues but not soundness issues, you
+/// should allow the unwind. Opting out of [`UnwindSafe`] indicates to your
+/// consumers that they need to consider correctness in the face of unwinds.
+///
+/// If an unwind would be unsound, then this function should be used in order
+/// to prevent unwinds. However, note that `extern "C" fn` will automatically
+/// convert unwinds to aborts, so using this function isn't necessary for FFI.
+#[unstable(feature = "abort_unwind", issue = "130338")]
+#[rustc_nounwind]
+pub fn abort_unwind<F: FnOnce() -> R, R>(f: F) -> R {
+    f()
 }
 
 /// An internal trait used by std to pass data from std to `panic_unwind` and
@@ -181,7 +170,7 @@ pub macro debug_assert_nounwind {
 /// use.
 #[unstable(feature = "std_internals", issue = "none")]
 #[doc(hidden)]
-pub unsafe trait PanicPayload {
+pub unsafe trait PanicPayload: crate::fmt::Display {
     /// Take full ownership of the contents.
     /// The return type is actually `Box<dyn Any + Send>`, but we cannot use `Box` in core.
     ///
@@ -194,4 +183,65 @@ pub unsafe trait PanicPayload {
 
     /// Just borrow the contents.
     fn get(&mut self) -> &(dyn Any + Send);
+
+    /// Tries to borrow the contents as `&str`, if possible without doing any allocations.
+    fn as_str(&mut self) -> Option<&str> {
+        None
+    }
+}
+
+/// Helper macro for panicking in a `const fn`.
+/// Invoke as:
+/// ```rust,ignore (just an example)
+/// core::macros::const_panic!("boring message", "flavored message {a} {b:?}", a: u32 = foo.len(), b: Something = bar);
+/// ```
+/// where the first message will be printed in const-eval,
+/// and the second message will be printed at runtime.
+// All uses of this macro are FIXME(const-hack).
+#[unstable(feature = "panic_internals", issue = "none")]
+#[doc(hidden)]
+pub macro const_panic {
+    ($const_msg:literal, $runtime_msg:literal, $($arg:ident : $ty:ty = $val:expr),* $(,)?) => {{
+        // Wrap call to `const_eval_select` in a function so that we can
+        // add the `rustc_allow_const_fn_unstable`. This is okay to do
+        // because both variants will panic, just with different messages.
+        #[rustc_allow_const_fn_unstable(const_eval_select)]
+        #[inline(always)] // inline the wrapper
+        #[track_caller]
+        const fn do_panic($($arg: $ty),*) -> ! {
+            $crate::intrinsics::const_eval_select!(
+                @capture { $($arg: $ty = $arg),* } -> !:
+                #[noinline]
+                if const #[track_caller] #[inline] { // Inline this, to prevent codegen
+                    $crate::panic!($const_msg)
+                } else #[track_caller] { // Do not inline this, it makes perf worse
+                    $crate::panic!($runtime_msg)
+                }
+            )
+        }
+
+        do_panic($($val),*)
+    }},
+    // We support leaving away the `val` expressions for *all* arguments
+    // (but not for *some* arguments, that's too tricky).
+    ($const_msg:literal, $runtime_msg:literal, $($arg:ident : $ty:ty),* $(,)?) => {
+        $crate::panic::const_panic!(
+            $const_msg,
+            $runtime_msg,
+            $($arg: $ty = $arg),*
+        )
+    },
+}
+
+/// A version of `assert` that prints a non-formatting message in const contexts.
+///
+/// See [`const_panic!`].
+#[unstable(feature = "panic_internals", issue = "none")]
+#[doc(hidden)]
+pub macro const_assert {
+    ($condition: expr, $const_msg:literal, $runtime_msg:literal, $($arg:tt)*) => {{
+        if !$crate::intrinsics::likely($condition) {
+            $crate::panic::const_panic!($const_msg, $runtime_msg, $($arg)*)
+        }
+    }}
 }

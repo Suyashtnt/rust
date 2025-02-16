@@ -7,5 +7,6 @@ trait Has {
 trait HasNot {}
 
 fn main() {
-    HasNot::has(); //~ ERROR
+    HasNot::has();
+    //~^ ERROR expected a type, found a trait
 }

@@ -42,6 +42,19 @@ pub trait SimdConstPtr: Copy + Sealed {
     /// Equivalent to calling [`pointer::addr`] on each element.
     fn addr(self) -> Self::Usize;
 
+    /// Converts an address to a pointer without giving it any provenance.
+    ///
+    /// Without provenance, this pointer is not associated with any actual allocation. Such a
+    /// no-provenance pointer may be used for zero-sized memory accesses (if suitably aligned), but
+    /// non-zero-sized memory accesses with a no-provenance pointer are UB. No-provenance pointers
+    /// are little more than a usize address in disguise.
+    ///
+    /// This is different from [`Self::with_exposed_provenance`], which creates a pointer that picks up a
+    /// previously exposed provenance.
+    ///
+    /// Equivalent to calling [`core::ptr::without_provenance`] on each element.
+    fn without_provenance(addr: Self::Usize) -> Self;
+
     /// Creates a new pointer with the given address.
     ///
     /// This performs the same operation as a cast, but copies the *address-space* and
@@ -50,14 +63,14 @@ pub trait SimdConstPtr: Copy + Sealed {
     /// Equivalent to calling [`pointer::with_addr`] on each element.
     fn with_addr(self, addr: Self::Usize) -> Self;
 
-    /// Gets the "address" portion of the pointer, and "exposes" the provenance part for future use
-    /// in [`Self::from_exposed_addr`].
-    fn expose_addr(self) -> Self::Usize;
+    /// Exposes the "provenance" part of the pointer for future use in
+    /// [`Self::with_exposed_provenance`] and returns the "address" portion.
+    fn expose_provenance(self) -> Self::Usize;
 
-    /// Convert an address back to a pointer, picking up a previously "exposed" provenance.
+    /// Converts an address back to a pointer, picking up a previously "exposed" provenance.
     ///
-    /// Equivalent to calling [`core::ptr::from_exposed_addr`] on each element.
-    fn from_exposed_addr(addr: Self::Usize) -> Self;
+    /// Equivalent to calling [`core::ptr::with_exposed_provenance`] on each element.
+    fn with_exposed_provenance(addr: Self::Usize) -> Self;
 
     /// Calculates the offset from a pointer using wrapping arithmetic.
     ///
@@ -96,7 +109,7 @@ where
     fn cast<U>(self) -> Self::CastPtr<U> {
         // SimdElement currently requires zero-sized metadata, so this should never fail.
         // If this ever changes, `simd_cast_ptr` should produce a post-mono error.
-        use core::{mem::size_of, ptr::Pointee};
+        use core::ptr::Pointee;
         assert_eq!(size_of::<<T as Pointee>::Metadata>(), 0);
         assert_eq!(size_of::<<U as Pointee>::Metadata>(), 0);
 
@@ -119,6 +132,14 @@ where
     }
 
     #[inline]
+    fn without_provenance(addr: Self::Usize) -> Self {
+        // FIXME(strict_provenance_magic): I am magic and should be a compiler intrinsic.
+        // SAFETY: Integer-to-pointer transmutes are valid (if you are okay with not getting any
+        // provenance).
+        unsafe { core::mem::transmute_copy(&addr) }
+    }
+
+    #[inline]
     fn with_addr(self, addr: Self::Usize) -> Self {
         // FIXME(strict_provenance_magic): I am magic and should be a compiler intrinsic.
         //
@@ -131,15 +152,15 @@ where
     }
 
     #[inline]
-    fn expose_addr(self) -> Self::Usize {
+    fn expose_provenance(self) -> Self::Usize {
         // Safety: `self` is a pointer vector
-        unsafe { core::intrinsics::simd::simd_expose_addr(self) }
+        unsafe { core::intrinsics::simd::simd_expose_provenance(self) }
     }
 
     #[inline]
-    fn from_exposed_addr(addr: Self::Usize) -> Self {
+    fn with_exposed_provenance(addr: Self::Usize) -> Self {
         // Safety: `self` is a pointer vector
-        unsafe { core::intrinsics::simd::simd_from_exposed_addr(addr) }
+        unsafe { core::intrinsics::simd::simd_with_exposed_provenance(addr) }
     }
 
     #[inline]

@@ -1,4 +1,5 @@
 #![warn(clippy::to_string_trait_impl)]
+#![feature(min_specialization)]
 
 use std::fmt::{self, Display};
 

@@ -1,12 +1,11 @@
 //@ run-fail
 //@ error-pattern:attempt to negate with overflow
-//@ ignore-emscripten no processes
+//@ needs-subprocess
 //@ compile-flags: -C debug-assertions
-
 #![allow(arithmetic_overflow)]
 
-use std::num::NonZeroI8;
+use std::num::NonZero;
 
 fn main() {
-    let _x = -NonZeroI8::new(i8::MIN).unwrap();
+    let _x = -NonZero::new(i8::MIN).unwrap();
 }

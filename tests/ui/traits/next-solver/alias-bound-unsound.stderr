@@ -4,7 +4,6 @@ error[E0275]: overflow evaluating the requirement `String: Copy`
 LL |     type Item = String where String: Copy;
    |                                      ^^^^
    |
-   = help: consider increasing the recursion limit by adding a `#![recursion_limit = "256"]` attribute to your crate (`alias_bound_unsound`)
 note: the requirement `String: Copy` appears on the `impl`'s associated type `Item` but not on the corresponding trait's associated type
   --> $DIR/alias-bound-unsound.rs:8:10
    |
@@ -18,8 +17,12 @@ error[E0275]: overflow evaluating the requirement `String <: <() as Foo>::Item`
    |
 LL |     drop(<() as Foo>::copy_me(&x));
    |                               ^^
+
+error[E0275]: overflow evaluating the requirement `<() as Foo>::Item == _`
+  --> $DIR/alias-bound-unsound.rs:24:10
    |
-   = help: consider increasing the recursion limit by adding a `#![recursion_limit = "256"]` attribute to your crate (`alias_bound_unsound`)
+LL |     drop(<() as Foo>::copy_me(&x));
+   |          ^^^^^^^^^^^^^^^^^^^^^^^^
 
 error[E0275]: overflow evaluating the requirement `<() as Foo>::Item == _`
   --> $DIR/alias-bound-unsound.rs:24:10
@@ -27,23 +30,19 @@ error[E0275]: overflow evaluating the requirement `<() as Foo>::Item == _`
 LL |     drop(<() as Foo>::copy_me(&x));
    |          ^^^^^^^^^^^^^^^^^^^^^^^^
    |
-   = help: consider increasing the recursion limit by adding a `#![recursion_limit = "256"]` attribute to your crate (`alias_bound_unsound`)
+   = note: duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`
 
 error[E0275]: overflow evaluating the requirement `&<() as Foo>::Item well-formed`
   --> $DIR/alias-bound-unsound.rs:24:31
    |
 LL |     drop(<() as Foo>::copy_me(&x));
    |                               ^^
-   |
-   = help: consider increasing the recursion limit by adding a `#![recursion_limit = "256"]` attribute to your crate (`alias_bound_unsound`)
 
 error[E0275]: overflow evaluating the requirement `<() as Foo>::Item well-formed`
   --> $DIR/alias-bound-unsound.rs:24:10
    |
 LL |     drop(<() as Foo>::copy_me(&x));
    |          ^^^^^^^^^^^^^^^^^^^^^^^^
-   |
-   = help: consider increasing the recursion limit by adding a `#![recursion_limit = "256"]` attribute to your crate (`alias_bound_unsound`)
 
 error[E0275]: overflow evaluating the requirement `<() as Foo>::Item == _`
   --> $DIR/alias-bound-unsound.rs:24:10
@@ -51,9 +50,14 @@ error[E0275]: overflow evaluating the requirement `<() as Foo>::Item == _`
 LL |     drop(<() as Foo>::copy_me(&x));
    |          ^^^^^^^^^^^^^^^^^^^^^^^^
    |
-   = help: consider increasing the recursion limit by adding a `#![recursion_limit = "256"]` attribute to your crate (`alias_bound_unsound`)
    = note: duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`
 
-error: aborting due to 6 previous errors
+error[E0275]: overflow evaluating the requirement `<() as Foo>::Item == _`
+  --> $DIR/alias-bound-unsound.rs:24:31
+   |
+LL |     drop(<() as Foo>::copy_me(&x));
+   |                               ^^
+
+error: aborting due to 8 previous errors
 
 For more information about this error, try `rustc --explain E0275`.

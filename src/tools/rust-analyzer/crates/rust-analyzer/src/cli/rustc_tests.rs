@@ -5,12 +5,16 @@ use std::thread::Builder;
 use std::time::{Duration, Instant};
 use std::{cell::RefCell, fs::read_to_string, panic::AssertUnwindSafe, path::PathBuf};
 
-use hir::{Change, Crate};
+use hir::{ChangeWithProcMacros, Crate};
 use ide::{AnalysisHost, DiagnosticCode, DiagnosticsConfig};
 use itertools::Either;
+use paths::Utf8PathBuf;
 use profile::StopWatch;
-use project_model::target_data_layout::RustcDataLayoutConfig;
-use project_model::{target_data_layout, CargoConfig, ProjectWorkspace, RustLibSource, Sysroot};
+use project_model::toolchain_info::{target_data_layout, QueryConfig};
+use project_model::{
+    CargoConfig, ManifestPath, ProjectWorkspace, ProjectWorkspaceKind, RustLibSource, Sysroot,
+    SysrootSourceWorkspaceConfig,
+};
 
 use load_cargo::{load_workspace, LoadCargoConfig, ProcMacroServerChoice};
 use rustc_hash::FxHashMap;
@@ -61,34 +65,44 @@ impl Tester {
     fn new() -> Result<Self> {
         let mut path = std::env::temp_dir();
         path.push("ra-rustc-test.rs");
-        let tmp_file = AbsPathBuf::try_from(path).unwrap();
+        let tmp_file = AbsPathBuf::try_from(Utf8PathBuf::from_path_buf(path).unwrap()).unwrap();
         std::fs::write(&tmp_file, "")?;
-        let cargo_config =
-            CargoConfig { sysroot: Some(RustLibSource::Discover), ..Default::default() };
+        let cargo_config = CargoConfig {
+            sysroot: Some(RustLibSource::Discover),
+            all_targets: true,
+            set_test: true,
+            ..Default::default()
+        };
 
-        let sysroot =
-            Ok(Sysroot::discover(tmp_file.parent().unwrap(), &cargo_config.extra_env, false)
-                .unwrap());
+        let mut sysroot = Sysroot::discover(tmp_file.parent().unwrap(), &cargo_config.extra_env);
+        sysroot.load_workspace(&SysrootSourceWorkspaceConfig::default_cargo());
         let data_layout = target_data_layout::get(
-            RustcDataLayoutConfig::Rustc(sysroot.as_ref().ok()),
+            QueryConfig::Rustc(&sysroot, tmp_file.parent().unwrap().as_ref()),
             None,
             &cargo_config.extra_env,
         );
 
-        let workspace = ProjectWorkspace::DetachedFiles {
-            files: vec![tmp_file.clone()],
+        let workspace = ProjectWorkspace {
+            kind: ProjectWorkspaceKind::DetachedFile {
+                file: ManifestPath::try_from(tmp_file).unwrap(),
+                cargo: None,
+                set_test: true,
+            },
             sysroot,
             rustc_cfg: vec![],
             toolchain: None,
             target_layout: data_layout.map(Arc::from).map_err(|it| Arc::from(it.to_string())),
+            cfg_overrides: Default::default(),
+            extra_includes: vec![],
         };
         let load_cargo_config = LoadCargoConfig {
             load_out_dirs_from_check: false,
             with_proc_macro_server: ProcMacroServerChoice::Sysroot,
             prefill_caches: false,
         };
-        let (host, _vfs, _proc_macro) =
+        let (db, _vfs, _proc_macro) =
             load_workspace(workspace, &cargo_config.extra_env, &load_cargo_config)?;
+        let host = AnalysisHost::with_database(db);
         let db = host.raw_database();
         let krates = Crate::all(db);
         let root_crate = krates.iter().cloned().find(|krate| krate.origin(db).is_local()).unwrap();
@@ -121,7 +135,7 @@ impl Tester {
             FxHashMap::default()
         };
         let text = read_to_string(&p).unwrap();
-        let mut change = Change::new();
+        let mut change = ChangeWithProcMacros::new();
         // Ignore unstable tests, since they move too fast and we do not intend to support all of them.
         let mut ignore_test = text.contains("#![feature");
         // Ignore test with extern crates, as this infra don't support them yet.
@@ -133,7 +147,7 @@ impl Tester {
         let should_have_no_error = text.contains("// check-pass")
             || text.contains("// build-pass")
             || text.contains("// run-pass");
-        change.change_file(self.root_file, Some(Arc::from(text)));
+        change.change_file(self.root_file, Some(text));
         self.host.apply_change(change);
         let diagnostic_config = DiagnosticsConfig::test_sample();
 
@@ -147,7 +161,7 @@ impl Tester {
                     let root_file = self.root_file;
                     move || {
                         let res = std::panic::catch_unwind(move || {
-                            analysis.diagnostics(
+                            analysis.full_diagnostics(
                                 diagnostic_config,
                                 ide::AssistResolveStrategy::None,
                                 root_file,
@@ -213,8 +227,8 @@ impl Tester {
             self.pass_count += 1;
         } else {
             println!("{p:?} FAIL");
-            println!("actual   (r-a)   = {:?}", actual);
-            println!("expected (rustc) = {:?}", expected);
+            println!("actual   (r-a)   = {actual:?}");
+            println!("expected (rustc) = {expected:?}");
             self.fail_count += 1;
         }
     }
@@ -285,7 +299,7 @@ impl flags::RustcTests {
                     continue;
                 }
             }
-            if p.extension().map_or(true, |x| x != "rs") {
+            if p.extension().is_none_or(|x| x != "rs") {
                 continue;
             }
             if let Err(e) = std::panic::catch_unwind({

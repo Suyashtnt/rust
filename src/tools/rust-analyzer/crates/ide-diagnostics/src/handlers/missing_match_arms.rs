@@ -23,9 +23,10 @@ mod tests {
         },
         DiagnosticsConfig,
     };
+    use test_utils::skip_slow_tests;
 
     #[track_caller]
-    fn check_diagnostics_no_bails(ra_fixture: &str) {
+    fn check_diagnostics_no_bails(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
         cov_mark::check_count!(validate_match_bailed_out, 0);
         crate::tests::check_diagnostics(ra_fixture)
     }
@@ -316,7 +317,8 @@ fn main() {
     #[test]
     fn mismatched_types_issue_15883() {
         // Check we don't panic.
-        check_diagnostics_no_bails(
+        cov_mark::check!(validate_match_bailed_out);
+        check_diagnostics(
             r#"
 //- minicore: option
 fn main() {
@@ -597,25 +599,35 @@ fn bang(never: !) {
 
     #[test]
     fn unknown_type() {
-        cov_mark::check_count!(validate_match_bailed_out, 1);
-
-        check_diagnostics(
+        check_diagnostics_no_bails(
             r#"
 enum Option<T> { Some(T), None }
 
 #[allow(unused)]
 fn main() {
     // `Never` is deliberately not defined so that it's an uninferred type.
+    // We ignore these to avoid triggering bugs in the analysis.
     match Option::<Never>::None {
-        None => (),
-        Some(never) => match never {},
+        Option::None => (),
+        Option::Some(never) => match never {},
     }
     match Option::<Never>::None {
-        //^^^^^^^^^^^^^^^^^^^^^ error: missing match arm: `None` not covered
         Option::Some(_never) => {},
     }
 }
 "#,
+        );
+    }
+
+    #[test]
+    fn arity_mismatch_issue_16746() {
+        check_diagnostics_with_disabled(
+            r#"
+fn main() {
+    let (a, ) = (0, 0);
+}
+"#,
+            &["E0308"],
         );
     }
 
@@ -994,6 +1006,70 @@ fn f() {
         );
     }
 
+    #[test]
+    fn exponential_match() {
+        if skip_slow_tests() {
+            return;
+        }
+        // Constructs a match where match checking takes exponential time. Ensures we bail early.
+        use std::fmt::Write;
+        let struct_arity = 50;
+        let mut code = String::new();
+        write!(code, "struct BigStruct {{").unwrap();
+        for i in 0..struct_arity {
+            write!(code, "  field{i}: bool,").unwrap();
+        }
+        write!(code, "}}").unwrap();
+        write!(code, "fn big_match(s: BigStruct) {{").unwrap();
+        write!(code, "  match s {{").unwrap();
+        for i in 0..struct_arity {
+            write!(code, "    BigStruct {{ field{i}: true, ..}} => {{}},").unwrap();
+            write!(code, "    BigStruct {{ field{i}: false, ..}} => {{}},").unwrap();
+        }
+        write!(code, "    _ => {{}},").unwrap();
+        write!(code, "  }}").unwrap();
+        write!(code, "}}").unwrap();
+        check_diagnostics_no_bails(&code);
+    }
+
+    #[test]
+    fn min_exhaustive() {
+        check_diagnostics(
+            r#"
+//- minicore: result
+fn test(x: Result<i32, !>) {
+    match x {
+        Ok(_y) => {}
+    }
+}
+"#,
+        );
+        check_diagnostics(
+            r#"
+//- minicore: result
+fn test(ptr: *const Result<i32, !>) {
+    unsafe {
+        match *ptr {
+            //^^^^ error: missing match arm: `Err(!)` not covered
+            Ok(_x) => {}
+        }
+    }
+}
+"#,
+        );
+        check_diagnostics(
+            r#"
+//- minicore: result
+fn test(x: Result<i32, &'static !>) {
+    match x {
+        //^ error: missing match arm: `Err(_)` not covered
+        Ok(_y) => {}
+    }
+}
+"#,
+        );
+    }
+
     mod rust_unstable {
         use super::*;
 
@@ -1036,6 +1112,25 @@ fn test(x: Option<lib::PrivatelyUninhabited>) {
 }",
             );
         }
+    }
+
+    #[test]
+    fn non_exhaustive_may_be_empty() {
+        check_diagnostics_no_bails(
+            r"
+//- /main.rs crate:main deps:dep
+// In a different crate
+fn empty_match_on_empty_struct<T>(x: dep::UninhabitedStruct) -> T {
+    match x {}
+}
+//- /dep.rs crate:dep
+#[non_exhaustive]
+pub struct UninhabitedStruct {
+    pub never: !,
+    // other fields
+}
+",
+        );
     }
 
     mod false_negatives {

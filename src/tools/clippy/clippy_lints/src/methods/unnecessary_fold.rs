@@ -8,7 +8,7 @@ use rustc_hir as hir;
 use rustc_hir::PatKind;
 use rustc_lint::LateContext;
 use rustc_middle::ty;
-use rustc_span::{sym, Span};
+use rustc_span::{Span, sym};
 
 use super::UNNECESSARY_FOLD;
 
@@ -20,7 +20,7 @@ fn needs_turbofish(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> bool {
 
     // some common cases where turbofish isn't needed:
     // - assigned to a local variable with a type annotation
-    if let hir::Node::Local(local) = parent
+    if let hir::Node::LetStmt(local) = parent
         && local.ty.is_some()
     {
         return false;
@@ -130,9 +130,9 @@ pub(super) fn check(
                     fold_span,
                     hir::BinOpKind::Or,
                     Replacement {
+                        method_name: "any",
                         has_args: true,
                         has_generic_return: false,
-                        method_name: "any",
                     },
                 );
             },
@@ -144,24 +144,26 @@ pub(super) fn check(
                     fold_span,
                     hir::BinOpKind::And,
                     Replacement {
+                        method_name: "all",
                         has_args: true,
                         has_generic_return: false,
-                        method_name: "all",
                     },
                 );
             },
-            ast::LitKind::Int(Pu128(0), _) => check_fold_with_op(
-                cx,
-                expr,
-                acc,
-                fold_span,
-                hir::BinOpKind::Add,
-                Replacement {
-                    has_args: false,
-                    has_generic_return: needs_turbofish(cx, expr),
-                    method_name: "sum",
-                },
-            ),
+            ast::LitKind::Int(Pu128(0), _) => {
+                check_fold_with_op(
+                    cx,
+                    expr,
+                    acc,
+                    fold_span,
+                    hir::BinOpKind::Add,
+                    Replacement {
+                        method_name: "sum",
+                        has_args: false,
+                        has_generic_return: needs_turbofish(cx, expr),
+                    },
+                );
+            },
             ast::LitKind::Int(Pu128(1), _) => {
                 check_fold_with_op(
                     cx,
@@ -170,9 +172,9 @@ pub(super) fn check(
                     fold_span,
                     hir::BinOpKind::Mul,
                     Replacement {
+                        method_name: "product",
                         has_args: false,
                         has_generic_return: needs_turbofish(cx, expr),
-                        method_name: "product",
                     },
                 );
             },

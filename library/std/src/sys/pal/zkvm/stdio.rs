@@ -1,4 +1,5 @@
-use super::{abi, abi::fileno};
+use super::abi;
+use super::abi::fileno;
 use crate::io;
 
 pub struct Stdin;
@@ -53,7 +54,7 @@ impl io::Write for Stderr {
     }
 }
 
-pub const STDIN_BUF_SIZE: usize = crate::sys_common::io::DEFAULT_BUF_SIZE;
+pub const STDIN_BUF_SIZE: usize = crate::sys::io::DEFAULT_BUF_SIZE;
 
 pub fn is_ebadf(_err: &io::Error) -> bool {
     true

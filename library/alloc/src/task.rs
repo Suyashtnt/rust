@@ -7,14 +7,14 @@
 //! This may be detected at compile time using
 //! `#[cfg(target_has_atomic = "ptr")]`.
 
-use crate::rc::Rc;
 use core::mem::ManuallyDrop;
-use core::task::{LocalWaker, RawWaker, RawWakerVTable};
-
-#[cfg(target_has_atomic = "ptr")]
-use crate::sync::Arc;
 #[cfg(target_has_atomic = "ptr")]
 use core::task::Waker;
+use core::task::{LocalWaker, RawWaker, RawWakerVTable};
+
+use crate::rc::Rc;
+#[cfg(target_has_atomic = "ptr")]
+use crate::sync::Arc;
 
 /// The implementation of waking a task on an executor.
 ///
@@ -136,10 +136,19 @@ impl<W: Wake + Send + Sync + 'static> From<Arc<W>> for RawWaker {
 #[inline(always)]
 fn raw_waker<W: Wake + Send + Sync + 'static>(waker: Arc<W>) -> RawWaker {
     // Increment the reference count of the arc to clone it.
+    //
+    // The #[inline(always)] is to ensure that raw_waker and clone_waker are
+    // always generated in the same code generation unit as one another, and
+    // therefore that the structurally identical const-promoted RawWakerVTable
+    // within both functions is deduplicated at LLVM IR code generation time.
+    // This allows optimizing Waker::will_wake to a single pointer comparison of
+    // the vtable pointers, rather than comparing all four function pointers
+    // within the vtables.
+    #[inline(always)]
     unsafe fn clone_waker<W: Wake + Send + Sync + 'static>(waker: *const ()) -> RawWaker {
         unsafe { Arc::increment_strong_count(waker as *const W) };
         RawWaker::new(
-            waker as *const (),
+            waker,
             &RawWakerVTable::new(clone_waker::<W>, wake::<W>, wake_by_ref::<W>, drop_waker::<W>),
         )
     }
@@ -167,9 +176,11 @@ fn raw_waker<W: Wake + Send + Sync + 'static>(waker: Arc<W>) -> RawWaker {
     )
 }
 
-/// An analogous trait to `Wake` but used to construct a `LocalWaker`. This API
-/// works in exactly the same way as `Wake`, except that it uses an `Rc` instead
-/// of an `Arc`, and the result is a `LocalWaker` instead of a `Waker`.
+/// An analogous trait to `Wake` but used to construct a `LocalWaker`.
+///
+/// This API works in exactly the same way as `Wake`,
+/// except that it uses an `Rc` instead of an `Arc`,
+/// and the result is a `LocalWaker` instead of a `Waker`.
 ///
 /// The benefits of using `LocalWaker` over `Waker` are that it allows the local waker
 /// to hold data that does not implement `Send` and `Sync`. Additionally, it saves calls
@@ -188,7 +199,6 @@ fn raw_waker<W: Wake + Send + Sync + 'static>(waker: Arc<W>) -> RawWaker {
 ///
 /// ```rust
 /// #![feature(local_waker)]
-/// #![feature(noop_waker)]
 /// use std::task::{LocalWake, ContextBuilder, LocalWaker, Waker};
 /// use std::future::Future;
 /// use std::pin::Pin;
@@ -304,10 +314,14 @@ impl<W: LocalWake + 'static> From<Rc<W>> for RawWaker {
 #[inline(always)]
 fn local_raw_waker<W: LocalWake + 'static>(waker: Rc<W>) -> RawWaker {
     // Increment the reference count of the Rc to clone it.
+    //
+    // Refer to the comment on raw_waker's clone_waker regarding why this is
+    // always inline.
+    #[inline(always)]
     unsafe fn clone_waker<W: LocalWake + 'static>(waker: *const ()) -> RawWaker {
         unsafe { Rc::increment_strong_count(waker as *const W) };
         RawWaker::new(
-            waker as *const (),
+            waker,
             &RawWakerVTable::new(clone_waker::<W>, wake::<W>, wake_by_ref::<W>, drop_waker::<W>),
         )
     }
